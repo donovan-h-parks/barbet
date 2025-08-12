@@ -5,9 +5,9 @@ description = "Bacteria and Archaea Representation using Bidirectional Embedding
 authors = ["Robert Turnbull,  Mar Quiroga, Gabriele Marini, Torsten Seemann, Wytamma Wirth"]
 license = "Apache-2.0"
 readme = "README.rst"
-repository = "https://github.com/bloodhound-devs/barbet/"
-documentation = "https://bloodhound-devs.github.io/barbet"
-homepage = "https://github.com/bloodhound-devs/barbet/"
+repository = "https://github.com/houndry/barbet/"
+documentation = "https://houndry.github.io/barbet"
+homepage = "https://github.com/houndry/barbet/"
 keywords = ["torchapp", "pytorch", "deep learning", "command-line interface"]
 # For classifiers see https://pypi.org/classifiers/
 classifiers = [

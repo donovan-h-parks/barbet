@@ -1,4 +1,4 @@
-.. image:: https://github.com/bloodhound-devs/barbet/blob/main/docs/images/barbet-banner.jpg?raw=true
+.. image:: https://github.com/houndry/barbet/blob/main/docs/images/barbet-banner.jpg?raw=true
 
 .. start-badges
 
@@ -8,17 +8,17 @@
    :alt: PyPI - Version
    :target: https://pypi.org/project/barbet/
 
-.. |testing badge| image:: https://github.com/bloodhound-devs/barbet/actions/workflows/testing.yml/badge.svg
-    :target: https://github.com/bloodhound-devs/barbet/actions
+.. |testing badge| image:: https://github.com/houndry/barbet/actions/workflows/testing.yml/badge.svg
+    :target: https://github.com/houndry/barbet/actions
 
-.. |docs badge| image:: https://github.com/bloodhound-devs/barbet/actions/workflows/docs.yml/badge.svg
-    :target: https://bloodhound-devs.github.io/barbet
+.. |docs badge| image:: https://github.com/houndry/barbet/actions/workflows/docs.yml/badge.svg
+    :target: https://houndry.github.io/barbet
     
 .. |black badge| image:: https://img.shields.io/badge/code%20style-black-000000.svg
     :target: https://github.com/psf/black
     
 .. |coverage badge| image:: https://img.shields.io/endpoint?url=https://gist.githubusercontent.com/rbturnbull/09aad5114164b54daabe1f5efd02a009/raw/coverage-badge.json
-    :target: https://bloodhound-devs.github.io/barbet/coverage/
+    :target: https://houndry.github.io/barbet/coverage/
 
 .. |torchapp badge| image:: https://img.shields.io/badge/torch-app-B1230A.svg
     :target: https://rbturnbull.github.io/torchapp/
@@ -34,7 +34,7 @@ Install using pip:
 
 .. code-block:: bash
 
-    pip install git+https://github.com/bloodhound-devs/barbet.git
+    pip install git+https://github.com/houndry/barbet.git
 
 
 Usage
@@ -65,7 +65,7 @@ Training
 ==================================
 
 You can train the model on releases from GTDB or your own custom dataset.
-See the instructions in the documentation for `preprocessing <https://bloodhound-devs.github.io/barbet/preprocessing.html>`_ and `training <https://bloodhound-devs.github.io/barbet/training.html>`_.
+See the instructions in the documentation for `preprocessing <https://houndry.github.io/barbet/preprocessing.html>`_ and `training <https://houndry.github.io/barbet/training.html>`_.
 
 .. end-quickstart
 
