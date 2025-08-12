@@ -34,7 +34,7 @@ Install using pip:
 
 .. code-block:: bash
 
-    pip install git+https://github.com/houndry/barbet.git
+    pip install barbet
 
 
 Usage
