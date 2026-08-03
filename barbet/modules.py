@@ -22,7 +22,7 @@ class BarbetLightningModule(GeneralLightningModule):
         # self.logits = defaultdict(lambda: 0.0)
         # self.counts = defaultdict(lambda: 0)
         self.counter = 0
-        unique_names = list(set(names)) if isinstance(names, list) else [names]
+        unique_names = list(dict.fromkeys(names)) if isinstance(names, list) else [names]
         genome_count = len(unique_names)
         self.name_to_index = {name: i for i, name in enumerate(unique_names)}
         self.logits = torch.zeros(

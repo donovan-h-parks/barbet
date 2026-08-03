@@ -227,6 +227,12 @@ class Barbet(TorchApp):
         ),
         genome_idx: int = 1,
         total_genomes: int = 1,
+        single_seq: bool = Param(
+            False, help="Force single sequence (1-by-1) embedding mode."
+        ),
+        batched_seq: bool = Param(
+            False, help="Force batched sequence embedding mode."
+        ),
         **kwargs,
     ) -> "Iterable":
         import torch
@@ -234,6 +240,9 @@ class Barbet(TorchApp):
         from torch.utils.data import DataLoader
         from barbet.data import BarbetPredictionDataset
         
+        if single_seq and batched_seq:
+            raise ValueError("--single_seq and --batched_seq are mutually exclusive and cannot be used together.")
+
         # Set PyTorch thread limits
         torch.set_num_threads(cpus)
        
@@ -254,29 +263,65 @@ class Barbet(TorchApp):
         pct = (genome_idx / total_genomes) * 100 if total_genomes else 100.0
         description = f"[cyan]Embedding ({genome_idx:,}/{total_genomes:,} genomes, {pct:.1f}%)..."
 
-        with Progress(
-            TextColumn("{task.description}"),
-            BarColumn(),
-            TaskProgressColumn(),
-            TimeElapsedColumn(),
-            TimeRemainingColumn(),
-        ) as progress:
-            task = progress.add_task(description, total=len(fastas))
+        embedding_model = module.hparams.embedding_model
+        use_batched = batched_seq or (not single_seq and torch.cuda.is_available())
+
+        if use_batched and hasattr(embedding_model, "embed_batch"):
+            fasta_seq_items = []
             for fasta in fastas:
-                # read the fasta file sequence remove the header
-                fasta = Path(fasta)
-                seq = fasta.read_text().split("\n")[1]
-                vector = module.hparams.embedding_model(seq)
-                if vector is not None and not torch.isnan(vector).any():
-                    vector = vector.cpu().detach().clone().numpy()
-                    embeddings.append(vector)
+                fasta_path = Path(fasta)
+                lines = fasta_path.read_text().split("\n")
+                if len(lines) > 1 and lines[1].strip():
+                    fasta_seq_items.append((fasta_path, lines[1].strip()))
 
-                    gene_family_id = fasta.stem
-                    accession = f"{genome_path.stem}/{gene_family_id}"
-                    accessions.append(accession)
+            esm_batch_size = 64
+            with Progress(
+                TextColumn("{task.description}"),
+                BarColumn(),
+                TaskProgressColumn(),
+                TimeElapsedColumn(),
+                TimeRemainingColumn(),
+            ) as progress:
+                task = progress.add_task(description, total=len(fasta_seq_items))
+                for i in range(0, len(fasta_seq_items), esm_batch_size):
+                    batch_items = fasta_seq_items[i : i + esm_batch_size]
+                    batch_seqs = [seq for _, seq in batch_items]
+                    vectors = embedding_model.embed_batch(batch_seqs)
 
-                del vector
-                progress.advance(task)
+                    for (fasta_path, seq), vector in zip(batch_items, vectors):
+                        if vector is not None and not torch.isnan(vector).any():
+                            vector = vector.cpu().detach().clone().numpy()
+                            embeddings.append(vector)
+
+                            gene_family_id = fasta_path.stem
+                            accession = f"{genome_path.stem}/{gene_family_id}"
+                            accessions.append(accession)
+
+                    progress.advance(task, advance=len(batch_items))
+        else:
+            with Progress(
+                TextColumn("{task.description}"),
+                BarColumn(),
+                TaskProgressColumn(),
+                TimeElapsedColumn(),
+                TimeRemainingColumn(),
+            ) as progress:
+                task = progress.add_task(description, total=len(fastas))
+                for fasta in fastas:
+                    # read the fasta file sequence remove the header
+                    fasta = Path(fasta)
+                    seq = fasta.read_text().split("\n")[1]
+                    vector = embedding_model(seq)
+                    if vector is not None and not torch.isnan(vector).any():
+                        vector = vector.cpu().detach().clone().numpy()
+                        embeddings.append(vector)
+
+                        gene_family_id = fasta.stem
+                        accession = f"{genome_path.stem}/{gene_family_id}"
+                        accessions.append(accession)
+
+                    del vector
+                    progress.advance(task)
 
         embeddings = np.asarray(embeddings).astype(np.float16)
 
@@ -331,9 +376,17 @@ class Barbet(TorchApp):
             "https://data.ace.uq.edu.au/public/gtdbtk/release95/markers/tigrfam/tigrfam.hmm",
             help="The TIGRFAM database to use.",
         ),
+        single_seq: bool = Param(
+            False, help="Force single sequence (1-by-1) embedding mode."
+        ),
+        batched_seq: bool = Param(
+            False, help="Force batched sequence embedding mode."
+        ),
         **kwargs,
     ):
         """Barbet is a tool for assigning taxonomic labels to genomes using Machine Learning."""
+        if single_seq and batched_seq:
+            raise ValueError("--single_seq and --batched_seq are mutually exclusive and cannot be used together.")
         start_time = time.perf_counter()
         self.start_time = start_time
         self.output_dir = Path(output_dir)
@@ -408,23 +461,56 @@ class Barbet(TorchApp):
         kwargs_dataloader.pop("genome_idx", None)
         kwargs_dataloader.pop("total_genomes", None)
 
+        stack_size = module.hparams.get("stack_size", 32)
+        repeats = kwargs.get("repeats", 2)
+        batch_size = kwargs.get("batch_size", 64)
+        dataloader_workers = kwargs.get("dataloader_workers", 4)
+
         start_time_embed_classify = time.perf_counter()
+
+        all_embeddings_list = []
+        all_accessions = []
+
         for idx, (genome_path, maker_genes) in enumerate(markers_gene_map.items(), start=1):
             genome_path = Path(genome_path)
-            prediction_dataloader = self.prediction_dataloader(
+            self.prediction_dataloader(
                 module,
                 genome_path,
                 maker_genes,
                 cpus=cpus,
                 genome_idx=idx,
                 total_genomes=total_genomes,
+                single_seq=single_seq,
+                batched_seq=batched_seq,
                 **kwargs_dataloader,
             )
-            module.setup_prediction(self, genome_path.name)
-            trainer.predict(module, dataloaders=prediction_dataloader)
-            results_df = module.results_df
+            if len(self.prediction_dataset.array) > 0:
+                all_embeddings_list.append(self.prediction_dataset.array)
+                all_accessions.extend(self.prediction_dataset.accessions)
 
-            total_df = results_df if total_df is None else pl.concat([total_df, results_df], how="vertical")
+        if all_embeddings_list:
+            import numpy as np
+            from torch.utils.data import DataLoader
+            from barbet.data import BarbetPredictionDataset
+
+            all_embeddings_arr = np.concatenate(all_embeddings_list, axis=0)
+            self.prediction_dataset = BarbetPredictionDataset(
+                array=all_embeddings_arr,
+                accessions=all_accessions,
+                stack_size=stack_size,
+                repeats=repeats,
+                seed=42,
+            )
+            combined_dataloader = DataLoader(
+                self.prediction_dataset,
+                batch_size=batch_size,
+                num_workers=dataloader_workers,
+                shuffle=False,
+            )
+            names = [stack.genome for stack in self.prediction_dataset.stacks]
+            module.setup_prediction(self, names)
+            trainer.predict(module, dataloaders=combined_dataloader)
+            total_df = module.results_df
 
         embed_classify_time = time.perf_counter() - start_time_embed_classify
         self.logger.info(

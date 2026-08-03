@@ -206,6 +206,10 @@ class Embedding(CLIApp, ABC):
         tensor = tensor/weights.unsqueeze(1)
 
         return self.reduce(tensor)
+
+    def embed_batch(self, seqs: list[str]) -> list[torch.Tensor]:
+        """ Takes a list of protein sequences and returns a list of 1D embedding vectors. """
+        return [self(seq) for seq in seqs]
     
     @method
     def setup(self, **kwargs):

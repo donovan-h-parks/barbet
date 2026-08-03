@@ -135,12 +135,30 @@ class ESMEmbedding(Embedding):
 
         return embedding_tensor
     
-    # def embed_batch(self, seqs:list[str]) -> torch.Tensor:
-    #     """ Takes a list of protein sequences and returns a tensor of embeddings per residue. """
-    #     if isinstance(self.layers, (str,int)):
-    #         self.layers = ESMLayers.from_value(self.layers)
-        
-    #     layers = int(self.layers.value)
+    def embed_batch(self, seqs: list[str]) -> list[torch.Tensor]:
+        """ Takes a list of protein sequences and returns a list of 1D embedding vectors. """
+        if isinstance(self.layers, (str, int)):
+            self.layers = ESMLayers.from_value(self.layers)
 
-    #     # Handle ambiguous AAs
-    #     #
+        layers = int(self.layers.value)
+        seqs = [s.replace("J", "X") for s in seqs]
+
+        if not self.model:
+            self.load()
+
+        data = [(f"marker_{i}", s) for i, s in enumerate(seqs)]
+        _, _, batch_tokens = self.batch_converter(data)
+        batch_tokens = batch_tokens.to(self.device)
+        batch_lens = (batch_tokens != self.alphabet.padding_idx).sum(1)
+
+        with torch.no_grad():
+            results = self.model(batch_tokens, repr_layers=[layers], return_contacts=False)
+        token_representations = results["representations"][layers]
+
+        embeddings = []
+        for i, (seq, seq_len) in enumerate(zip(seqs, batch_lens)):
+            emb = token_representations[i, 1 : seq_len - 1]
+            assert len(seq) == len(emb), f"Embedding representation incorrect length. Should be {len(seq)} but is {len(emb)}"
+            embeddings.append(self.reduce(emb))
+
+        return embeddings
