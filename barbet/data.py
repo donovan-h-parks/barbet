@@ -66,9 +66,9 @@ class BarbetPredictionDataset(Dataset):
             genome_to_array_indices[genome].add(index)
 
         # Build stacks
-        random.seed(self.seed)
         self.stacks = []
         for genome, genome_array_indices in genome_to_array_indices.items():
+            random.seed(self.seed)
             stack_indices = []
             remainder = []
             for repeat_index in range(self.repeats + 1):
