@@ -250,7 +250,7 @@ class Barbet(TorchApp):
         embeddings = []
         accessions = []
 
-        fastas = markers[domain]
+        fastas = sorted(markers[domain])  # sort for determinism independent of HMMER output order
         pct = (genome_idx / total_genomes) * 100 if total_genomes else 100.0
         description = f"[cyan]Embedding ({genome_idx:,}/{total_genomes:,} genomes, {pct:.1f}%)..."
 

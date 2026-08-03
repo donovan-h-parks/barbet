@@ -339,7 +339,7 @@ def parse_domtblout_top_hits(domtbl_path: str) -> Dict[str, List[str]]:
     hits: Dict[str, List[str]] = {}
     for seq_id, (hmm_id, _, _) in seq_matches.items():
         hits.setdefault(hmm_id, []).append(seq_id)
-    return hits
+    return {hmm: sorted(seq_list) for hmm, seq_list in hits.items()}
 
 
 def _process_single_genome(
@@ -447,7 +447,7 @@ def _process_single_genome(
     tg_hits = parse_domtblout_top_hits(tg_out)
     combined_hits = {**pf_hits, **tg_hits}
 
-    for marker, seq_ids in combined_hits.items():
+    for marker, seq_ids in sorted(combined_hits.items()):
         if not seq_ids:
             continue
         elif len(seq_ids) == 1:
@@ -457,7 +457,7 @@ def _process_single_genome(
             if len(unique_seqs) != 1 and skip_multiple_hits:
                 # faster but can miss some markers
                 continue
-            seqs = list(unique_seqs)[:number_of_hits_to_keep]
+            seqs = sorted(unique_seqs)[:number_of_hits_to_keep]
 
         for dom in ("bac120", "ar53"):
             if (dom == "bac120" and marker in BAC120_MARKERS) or (
@@ -589,5 +589,5 @@ def extract_markers_genes(
             # Ensure we update the overall task to the final count
             rich_progress.update(overall_task, completed=n_genomes)
 
-    return results
+    return {gid: results[fasta_path] for gid, fasta_path in genomes.items() if fasta_path in results}
 
