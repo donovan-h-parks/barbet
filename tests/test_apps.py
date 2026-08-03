@@ -87,14 +87,11 @@ def test_predict(k, tmp_path):
     
     # Check output directory
     assert output_dir.exists()    
-    assert (output_dir / "0.fa").exists()
-    assert (output_dir / "0.fa" / "pfam.tblout").exists()
+    assert (output_dir / "barbet.log").exists()
+    assert (output_dir / "barbet-predictions.csv").exists()
+    assert (output_dir / "results" / "0.fa").exists()
+    assert (output_dir / "results" / "0.fa" / "pfam.tblout").exists()
 
-    # Check image files
-    # image_file = (output_dir / "0.fa.gz.dot")
-    # assert image_file.exists()
-    # assert 'root" -> "A" [label=0.18' in image_file.read_text()
-    
     # Check result df
     assert len(results) == k
     assert 'name' in results.columns
@@ -104,4 +101,25 @@ def test_predict(k, tmp_path):
         assert f"{i}.fa.gz" in row['name']
         assert row['species_prediction'] == 'E'
         assert 0.29 < row['species_probability'] < 0.30
+
+
+def test_predict_rm_intermediate(tmp_path):
+    barbet = Barbet()
+    barbet.load_checkpoint = lambda *args, **kwargs: MockCheckpoint()
+    barbet.prediction_trainer = lambda *args, **kwargs: MockPredictionTrainer()
+
+    output_dir = tmp_path / "output_rm"
+    data_dir = tmp_path / "data"
+    data_dir.mkdir(parents=True, exist_ok=True)
+    input_file = tmp_path / "0.fa.gz"
+    input_file.write_bytes((TEST_DATA_DIR / "MAG-GUT41.fa.gz").read_bytes())
+
+    results = barbet.predict(input=[input_file], output_dir=output_dir, rm_intermediate=True)
+
+    assert output_dir.exists()
+    assert (output_dir / "barbet-predictions.csv").exists()
+    assert (output_dir / "barbet.log").exists()
+    assert not (output_dir / "results").exists()
+
+
         
