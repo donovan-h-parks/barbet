@@ -123,7 +123,7 @@ class ESMEmbedding(Embedding):
 
         # Extract per-residue representations (on CPU)
         with torch.no_grad():
-            results = self.model(batch_tokens, repr_layers=[layers], return_contacts=True)
+            results = self.model(batch_tokens, repr_layers=[layers], return_contacts=False)
         token_representations = results["representations"][layers]
 
         assert len(batch_lens) == 1, f"More than one length found"
