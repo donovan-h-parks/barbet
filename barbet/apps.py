@@ -227,21 +227,12 @@ class Barbet(TorchApp):
         ),
         genome_idx: int = 1,
         total_genomes: int = 1,
-        single_seq: bool = Param(
-            False, help="Force single sequence (1-by-1) embedding mode."
-        ),
-        batched_seq: bool = Param(
-            False, help="Force batched sequence embedding mode."
-        ),
         **kwargs,
     ) -> "Iterable":
         import torch
         import numpy as np
         from torch.utils.data import DataLoader
         from barbet.data import BarbetPredictionDataset
-        
-        if single_seq and batched_seq:
-            raise ValueError("--single_seq and --batched_seq are mutually exclusive and cannot be used together.")
 
         # Set PyTorch thread limits
         torch.set_num_threads(cpus)
@@ -264,64 +255,30 @@ class Barbet(TorchApp):
         description = f"[cyan]Embedding ({genome_idx:,}/{total_genomes:,} genomes, {pct:.1f}%)..."
 
         embedding_model = module.hparams.embedding_model
-        use_batched = batched_seq or (not single_seq and torch.cuda.is_available())
 
-        if use_batched and hasattr(embedding_model, "embed_batch"):
-            fasta_seq_items = []
+        with Progress(
+            TextColumn("{task.description}"),
+            BarColumn(),
+            TaskProgressColumn(),
+            TimeElapsedColumn(),
+            TimeRemainingColumn(),
+        ) as progress:
+            task = progress.add_task(description, total=len(fastas))
             for fasta in fastas:
-                fasta_path = Path(fasta)
-                lines = fasta_path.read_text().split("\n")
-                if len(lines) > 1 and lines[1].strip():
-                    fasta_seq_items.append((fasta_path, lines[1].strip()))
+                # read the fasta file sequence remove the header
+                fasta = Path(fasta)
+                seq = fasta.read_text().split("\n")[1]
+                vector = embedding_model(seq)
+                if vector is not None and not torch.isnan(vector).any():
+                    vector = vector.cpu().detach().clone().numpy()
+                    embeddings.append(vector)
 
-            esm_batch_size = 64
-            with Progress(
-                TextColumn("{task.description}"),
-                BarColumn(),
-                TaskProgressColumn(),
-                TimeElapsedColumn(),
-                TimeRemainingColumn(),
-            ) as progress:
-                task = progress.add_task(description, total=len(fasta_seq_items))
-                for i in range(0, len(fasta_seq_items), esm_batch_size):
-                    batch_items = fasta_seq_items[i : i + esm_batch_size]
-                    batch_seqs = [seq for _, seq in batch_items]
-                    vectors = embedding_model.embed_batch(batch_seqs)
+                    gene_family_id = fasta.stem
+                    accession = f"{genome_path.stem}/{gene_family_id}"
+                    accessions.append(accession)
 
-                    for (fasta_path, seq), vector in zip(batch_items, vectors):
-                        if vector is not None and not torch.isnan(vector).any():
-                            vector = vector.cpu().detach().clone().numpy()
-                            embeddings.append(vector)
-
-                            gene_family_id = fasta_path.stem
-                            accession = f"{genome_path.stem}/{gene_family_id}"
-                            accessions.append(accession)
-
-                    progress.advance(task, advance=len(batch_items))
-        else:
-            with Progress(
-                TextColumn("{task.description}"),
-                BarColumn(),
-                TaskProgressColumn(),
-                TimeElapsedColumn(),
-                TimeRemainingColumn(),
-            ) as progress:
-                task = progress.add_task(description, total=len(fastas))
-                for fasta in fastas:
-                    # read the fasta file sequence remove the header
-                    fasta = Path(fasta)
-                    seq = fasta.read_text().split("\n")[1]
-                    vector = embedding_model(seq)
-                    if vector is not None and not torch.isnan(vector).any():
-                        vector = vector.cpu().detach().clone().numpy()
-                        embeddings.append(vector)
-
-                        gene_family_id = fasta.stem
-                        accession = f"{genome_path.stem}/{gene_family_id}"
-                        accessions.append(accession)
-
-                    del vector
-                    progress.advance(task)
+                del vector
+                progress.advance(task)
 
         embeddings = np.asarray(embeddings).astype(np.float16)
 
@@ -376,17 +333,9 @@ class Barbet(TorchApp):
             "https://data.ace.uq.edu.au/public/gtdbtk/release95/markers/tigrfam/tigrfam.hmm",
             help="The TIGRFAM database to use.",
         ),
-        single_seq: bool = Param(
-            False, help="Force single sequence (1-by-1) embedding mode."
-        ),
-        batched_seq: bool = Param(
-            False, help="Force batched sequence embedding mode."
-        ),
         **kwargs,
     ):
         """Barbet is a tool for assigning taxonomic labels to genomes using Machine Learning."""
-        if single_seq and batched_seq:
-            raise ValueError("--single_seq and --batched_seq are mutually exclusive and cannot be used together.")
         start_time = time.perf_counter()
         self.start_time = start_time
         self.output_dir = Path(output_dir)
@@ -480,8 +429,6 @@ class Barbet(TorchApp):
                 cpus=cpus,
                 genome_idx=idx,
                 total_genomes=total_genomes,
-                single_seq=single_seq,
-                batched_seq=batched_seq,
                 **kwargs_dataloader,
             )
             if len(self.prediction_dataset.array) > 0:
