@@ -349,6 +349,24 @@ class Barbet(TorchApp):
             default="https://data.ace.uq.edu.au/public/gtdbtk/release95/markers/tigrfam/tigrfam.hmm",
             help="The TIGRFAM database to use.",
         ),
+        output_predictions: Path = Param(
+            default=None,
+            help="A path to output the top N predictions per rank as a TSV file."
+        ),
+        num_predictions: int = Param(
+            default=1,
+            help="The number of top predictions per rank to output when --output-predictions is specified."
+        ),
+        global_predictions: bool = Param(
+            default=False,
+            help=(
+                "When set, the top N taxa at each rank are chosen globally across the entire "
+                "taxonomy (not just within the children of the greedy top-1 parent). "
+                "Requires --output-predictions to be set. "
+                "Output columns change to joint_probability, local_probability, prediction_number, "
+                "and in_predicted_lineage."
+            ),
+        ),
         **kwargs,
     ):
         """Barbet is a tool for assigning taxonomic labels to genomes using Machine Learning."""
@@ -540,9 +558,34 @@ class Barbet(TorchApp):
                 shuffle=False,
             )
             names = [stack.genome for stack in self.prediction_dataset.stacks]
-            module.setup_prediction(self, names)
+            # Global-predictions mode requires the full probability matrix to be
+            # retained after inference (to rank nodes across the whole taxonomy).
+            save_probs = bool(output_predictions) or global_predictions
+            if global_predictions and not output_predictions:
+                self.logger.warning(
+                    "--global-predictions has no effect without --output-predictions."
+                )
+            module.setup_prediction(self, names, save_probabilities=save_probs)
             trainer.predict(module, dataloaders=combined_dataloader)
             total_df = module.results_df
+
+            if output_predictions:
+                if isinstance(output_predictions, bool) or str(output_predictions).lower() in ("true", "1"):
+                    out_pred_path = self.output_dir / "barbet-top-predictions.tsv"
+                else:
+                    out_pred_path = Path(output_predictions)
+                    if out_pred_path.is_dir():
+                        out_pred_path = out_pred_path / "barbet-top-predictions.tsv"
+                    elif not out_pred_path.is_absolute() and len(out_pred_path.parts) == 1:
+                        out_pred_path = self.output_dir / out_pred_path
+                out_pred_path.parent.mkdir(exist_ok=True, parents=True)
+                top_preds_df = module.generate_top_predictions(
+                    self,
+                    num_predictions=num_predictions,
+                    global_predictions=global_predictions,
+                )
+                top_preds_df.write_csv(out_pred_path, separator="\t")
+                self.logger.info(f"Saved top predictions to: '{out_pred_path}'")
 
         embed_classify_time = time.perf_counter() - start_time_embed_classify
         self.logger.info(
