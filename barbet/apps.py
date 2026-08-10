@@ -48,6 +48,13 @@ class ImageFormat(str, Enum):
 
 
 class Barbet(TorchApp):
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+        if hasattr(self, "main_app") and hasattr(self.main_app, "info"):
+            self.main_app.info.context_settings = {"help_option_names": ["-h", "--help"]}
+        if hasattr(self, "tools_app") and hasattr(self.tools_app, "info"):
+            self.tools_app.info.context_settings = {"help_option_names": ["-h", "--help"]}
+
     @property
     def logger(self) -> logging.Logger:
         if not hasattr(self, "_logger") or self._logger is None:
@@ -216,7 +223,7 @@ class Barbet(TorchApp):
             64, help="The batch size for the prediction dataloader."
         ),
         cpus: int = Param(
-            1, help="The number of CPUs to use for the prediction dataloader."
+            1, param_decls=["--cpus", "-c"], help="The number of CPUs to use for the prediction dataloader."
         ),
         dataloader_workers: int = Param(
             4, help="The number of workers to use for the dataloader."
@@ -225,8 +232,8 @@ class Barbet(TorchApp):
             2,
             help="The minimum number of times to use each protein embedding in the prediction.",
         ),
-        genome_idx: int = 1,
-        total_genomes: int = 1,
+        genome_idx: int = Param(1, hidden=True),
+        total_genomes: int = Param(1, hidden=True),
         **kwargs,
     ) -> "Iterable":
         import torch
@@ -274,7 +281,7 @@ class Barbet(TorchApp):
                     embeddings.append(vector)
 
                     gene_family_id = fasta.stem
-                    accession = f"{genome_path.stem}/{gene_family_id}"
+                    accession = f"{genome_path.name}/{gene_family_id}"
                     accessions.append(accession)
 
                 del vector
@@ -313,24 +320,33 @@ class Barbet(TorchApp):
         self,
         input: list[Path] = Param(
             default=...,
-            help="FASTA files or directories of FASTA files. Requires genome in an individual FASTA file."
+            param_decls=["--input", "-i"],
+            help="FASTA files, directories of FASTA files, or a TSV file (columns: fasta_path, [genome_id], [translation_table]). Requires genomes to be in individual FASTA file."
         ),
-        output_dir: Path = Param("output", help="A path to the output directory."),
+        output_dir: Path = Param(
+            default="output",
+            param_decls=["--output-dir", "-o"], 
+            help="A path to the output directory."
+        ),
         output_csv: Path = Param(
-            default=None, help="A path to output the results as a CSV."
+            default=None, 
+            help="A path to output the results as a CSV."
         ),
         rm_intermediate: bool = Param(
-            False, help="If set, remove the intermediate results directory after processing."
+            default=False, 
+            help="If set, remove the intermediate results directory after processing."
         ),
         cpus: int = Param(
-            1, help="The number of CPUs to use."
+            default=1, 
+            param_decls=["--cpus", "-c"], 
+            help="The number of CPUs to use."
         ),
         pfam_db: str = Param(
-            "https://data.ace.uq.edu.au/public/gtdbtk/release95/markers/pfam/Pfam-A.hmm",
+            default="https://data.ace.uq.edu.au/public/gtdbtk/release95/markers/pfam/Pfam-A.hmm",
             help="The Pfam database to use.",
         ),
         tigr_db: str = Param(
-            "https://data.ace.uq.edu.au/public/gtdbtk/release95/markers/tigrfam/tigrfam.hmm",
+            default="https://data.ace.uq.edu.au/public/gtdbtk/release95/markers/tigrfam/tigrfam.hmm",
             help="The TIGRFAM database to use.",
         ),
         **kwargs,
@@ -346,29 +362,97 @@ class Barbet(TorchApp):
         from itertools import chain
         from barbet.markers import extract_markers_genes
 
-        # Get list of files
+        # Get list of files & metadata
         files = []
+        genome_id_map = {}  # str(file_path) -> genome_id
+        translation_tables = {}  # genome_id -> translation_table (int)
+
         if isinstance(input, (str, Path)):
-            input = [input]
+            input = [Path(input)]
+        else:
+            input = [Path(p) for p in input]
+
         assert len(input) > 0, "No input files provided."
-        for path in input:
-            if path.is_dir():
-                for file in chain(
-                    path.rglob("*.fa"),
-                    path.rglob("*.fasta"),
-                    path.rglob("*.fna"),
-                    path.rglob("*.fa.gz"),
-                    path.rglob("*.fasta.gz"),
-                    path.rglob("*.fna.gz"),
-                ):
-                    files.append(file)
-            elif path.is_file():
-                files.append(path)
+
+        def _is_tsv_file(p: Path) -> bool:
+            if not p.is_file():
+                return False
+            if p.suffix.lower() in (".tsv", ".tab"):
+                return True
+            if p.suffix.lower() in (".fa", ".fasta", ".fna", ".gz"):
+                return False
+            try:
+                with open(p, "r", encoding="utf-8") as f:
+                    first_line = f.readline()
+                    if first_line and not first_line.startswith(">") and "\t" in first_line:
+                        return True
+            except Exception:
+                pass
+            return False
+
+        if len(input) == 1 and _is_tsv_file(input[0]):
+            tsv_path = input[0]
+            with open(tsv_path, "r", encoding="utf-8") as f:
+                for line_idx, line in enumerate(f, start=1):
+                    line_str = line.strip()
+                    if not line_str or line_str.startswith("#"):
+                        continue
+                    parts = [p.strip() for p in line_str.split("\t")]
+                    if not parts or not parts[0]:
+                        continue
+
+                    fasta_str = parts[0]
+                    fasta_path = Path(fasta_str)
+
+                    # Skip header line if col1 looks like header and file doesn't exist
+                    if line_idx == 1 and not fasta_path.exists():
+                        col1_lower = fasta_str.lower()
+                        if col1_lower in ("path", "fasta", "fasta_path", "file", "genome_path", "genome") or "fasta" in col1_lower or "path" in col1_lower:
+                            continue
+
+                    if not fasta_path.exists():
+                        raise FileNotFoundError(f"FASTA file specified in TSV does not exist: {fasta_str}")
+
+                    files.append(fasta_path)
+
+                    col2 = parts[1] if len(parts) > 1 and parts[1] else None
+                    gid = col2 if col2 else fasta_path.name
+                    genome_id_map[str(fasta_path)] = gid
+
+                    if len(parts) > 2 and parts[2]:
+                        raw_tt = parts[2]
+                        try:
+                            tt = int(raw_tt)
+                        except ValueError:
+                            raise ValueError(
+                                f"Invalid translation table '{raw_tt}' at line {line_idx} in {tsv_path}. Must be 4, 11, or 25."
+                            )
+                        if tt not in (4, 11, 25):
+                            raise ValueError(
+                                f"Invalid translation table '{tt}' at line {line_idx} in {tsv_path}. Must be either 4, 11, or 25."
+                            )
+                        translation_tables[gid] = tt
+        else:
+            for path in input:
+                if path.is_dir():
+                    for file in chain(
+                        path.rglob("*.fa"),
+                        path.rglob("*.fasta"),
+                        path.rglob("*.fna"),
+                        path.rglob("*.fa.gz"),
+                        path.rglob("*.fasta.gz"),
+                        path.rglob("*.fna.gz"),
+                    ):
+                        files.append(file)
+                        genome_id_map[str(file)] = file.name
+                elif path.is_file():
+                    files.append(path)
+                    genome_id_map[str(path)] = path.name
 
         # Check if any files were found
         if len(files) == 0:
             raise ValueError(
-                f"No files found in {input}. Please provide a directory or a list of files."
+                f"No files found in {input}. Please provide a directory, a list of files, or a TSV file."
             )
 
         # Check if output directory exists
@@ -387,12 +471,13 @@ class Barbet(TorchApp):
         ####################
         start_time_markers = time.perf_counter()
         markers_gene_map = extract_markers_genes(
-            genomes={file.stem: str(file) for file in files},
+            genomes={genome_id_map[str(file)]: str(file) for file in files},
             out_dir=str(results_dir),
             cpus=cpus,
             force=True,
             pfam_db=self.process_location(pfam_db),
             tigr_db=self.process_location(tigr_db),
+            translation_tables=translation_tables if translation_tables else None,
         )
         extract_markers_time = time.perf_counter() - start_time_markers
         self.logger.info(
@@ -420,8 +505,8 @@ class Barbet(TorchApp):
         all_embeddings_list = []
         all_accessions = []
 
-        for idx, (genome_path, maker_genes) in enumerate(markers_gene_map.items(), start=1):
-            genome_path = Path(genome_path)
+        for idx, (gid, maker_genes) in enumerate(markers_gene_map.items(), start=1):
+            genome_path = Path(gid)
             self.prediction_dataloader(
                 module,
                 genome_path,

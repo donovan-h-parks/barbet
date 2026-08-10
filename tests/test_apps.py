@@ -89,8 +89,8 @@ def test_predict(k, tmp_path):
     assert output_dir.exists()    
     assert (output_dir / "barbet.log").exists()
     assert (output_dir / "barbet-predictions.csv").exists()
-    assert (output_dir / "results" / "0.fa").exists()
-    assert (output_dir / "results" / "0.fa" / "pfam.tblout").exists()
+    assert (output_dir / "results" / "0.fa.gz").exists()
+    assert (output_dir / "results" / "0.fa.gz" / "pfam.tblout").exists()
 
     # Check result df
     assert len(results) == k
@@ -120,6 +120,50 @@ def test_predict_rm_intermediate(tmp_path):
     assert (output_dir / "barbet-predictions.csv").exists()
     assert (output_dir / "barbet.log").exists()
     assert not (output_dir / "results").exists()
+
+
+def test_predict_tsv_input(tmp_path):
+    barbet = Barbet()
+    barbet.load_checkpoint = lambda *args, **kwargs: MockCheckpoint()
+    barbet.prediction_trainer = lambda *args, **kwargs: MockPredictionTrainer()
+
+    output_dir = tmp_path / "output_tsv"
+    data_file = tmp_path / "genome.fa.gz"
+    data_file.write_bytes((TEST_DATA_DIR / "MAG-GUT41.fa.gz").read_bytes())
+
+    tsv_file = tmp_path / "input.tsv"
+    tsv_file.write_text(f"{data_file}\tCustomGenome1\t11\n")
+
+    results = barbet.predict(input=[tsv_file], output_dir=output_dir)
+
+    assert output_dir.exists()
+    assert (output_dir / "barbet-predictions.csv").exists()
+    assert len(results) == 1
+    assert results["name"][0] == "CustomGenome1"
+
+
+def test_predict_tsv_invalid_translation_table(tmp_path):
+    barbet = Barbet()
+    barbet.load_checkpoint = lambda *args, **kwargs: MockCheckpoint()
+    barbet.prediction_trainer = lambda *args, **kwargs: MockPredictionTrainer()
+
+    output_dir = tmp_path / "output_invalid"
+    data_file = tmp_path / "genome.fa.gz"
+    data_file.write_bytes((TEST_DATA_DIR / "MAG-GUT41.fa.gz").read_bytes())
+
+    tsv_file = tmp_path / "input_invalid.tsv"
+    tsv_file.write_text(f"{data_file}\tCustomGenome1\t5\n")
+
+    with pytest.raises(ValueError, match="translation table"):
+        barbet.predict(input=[tsv_file], output_dir=output_dir)
+
+
+def test_cli_help_flag():
+    barbet = Barbet()
+    assert "-h" in barbet.main_app.info.context_settings["help_option_names"]
+    assert "-h" in barbet.tools_app.info.context_settings["help_option_names"]
+
+
 
 
         

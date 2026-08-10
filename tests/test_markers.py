@@ -73,7 +73,7 @@ def test_identify_single_copy_fasta_integration(tmp_path, monkeypatch):
     assert genome_fa.exists()
 
     out = extract_markers_genes(
-        genomes={genome_fa.stem: str(genome_fa)},
+        genomes={genome_fa.name: str(genome_fa)},
         out_dir=str(tmp_path),
         cpus=2,
         pfam_db=str(pfam_db),
@@ -82,7 +82,7 @@ def test_identify_single_copy_fasta_integration(tmp_path, monkeypatch):
     )
 
     # should get one key per genome
-    genome_fa = str(genome_fa)
+    genome_fa = genome_fa.name
     assert genome_fa in out, f"Expected genome '{genome_fa}' in output"
 
     # now for each domain under that genome, we must have some FASTAs
