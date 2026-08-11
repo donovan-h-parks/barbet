@@ -367,6 +367,10 @@ class Barbet(TorchApp):
                 "and in_predicted_lineage."
             ),
         ),
+        context_vector_file: Path = Param(
+            default=None,
+            help="A path to output the N-dimensional mean-pooled context vectors per genome as a TSV file."
+        ),
         **kwargs,
     ):
         """Barbet is a tool for assigning taxonomic labels to genomes using Machine Learning."""
@@ -561,11 +565,12 @@ class Barbet(TorchApp):
             # Global-predictions mode requires the full probability matrix to be
             # retained after inference (to rank nodes across the whole taxonomy).
             save_probs = bool(output_predictions) or global_predictions
+            save_ctx = bool(context_vector_file)
             if global_predictions and not output_predictions:
                 self.logger.warning(
                     "--global-predictions has no effect without --output-predictions."
                 )
-            module.setup_prediction(self, names, save_probabilities=save_probs)
+            module.setup_prediction(self, names, save_probabilities=save_probs, save_context_vectors=save_ctx)
             trainer.predict(module, dataloaders=combined_dataloader)
             total_df = module.results_df
 
@@ -586,6 +591,19 @@ class Barbet(TorchApp):
                 )
                 top_preds_df.write_csv(out_pred_path, separator="\t")
                 self.logger.info(f"Saved top predictions to: '{out_pred_path}'")
+
+            if context_vector_file:
+                if isinstance(context_vector_file, bool) or str(context_vector_file).lower() in ("true", "1"):
+                    out_ctx_path = self.output_dir / "barbet-context-vectors.tsv"
+                else:
+                    out_ctx_path = Path(context_vector_file)
+                    if out_ctx_path.is_dir():
+                        out_ctx_path = out_ctx_path / "barbet-context-vectors.tsv"
+                    elif not out_ctx_path.is_absolute() and len(out_ctx_path.parts) == 1:
+                        out_ctx_path = self.output_dir / out_ctx_path
+                out_ctx_path.parent.mkdir(exist_ok=True, parents=True)
+                module.save_context_vectors_tsv(out_ctx_path)
+                self.logger.info(f"Saved context vectors to: '{out_ctx_path}'")
 
         embed_classify_time = time.perf_counter() - start_time_embed_classify
         self.logger.info(
@@ -627,6 +645,9 @@ class Barbet(TorchApp):
         probabilities: bool = Param(
             default=False, help="If True, include probabilities for all the nodes in the taxonomic tree."
         ),
+        context_vector_file: Path = Param(
+            default=None, help="A path to output the N-dimensional mean-pooled context vectors per genome as a TSV file."
+        ),
         **kwargs,
     ):
         """Barbet is a tool for assigning taxonomic labels to genomes using Machine Learning."""
@@ -636,9 +657,28 @@ class Barbet(TorchApp):
         trainer = self.prediction_trainer(module, **kwargs)
         prediction_dataloader = self.prediction_dataloader_memmap(module, **kwargs)
 
-        module.setup_prediction(self, [stack.genome for stack in self.prediction_dataset.stacks], save_probabilities=probabilities)
+        save_ctx = bool(context_vector_file)
+        module.setup_prediction(
+            self,
+            [stack.genome for stack in self.prediction_dataset.stacks],
+            save_probabilities=probabilities,
+            save_context_vectors=save_ctx,
+        )
         trainer.predict(module, dataloaders=prediction_dataloader, return_predictions=False)
         results_df = module.results_df
+
+        if context_vector_file:
+            if isinstance(context_vector_file, bool) or str(context_vector_file).lower() in ("true", "1"):
+                out_ctx_path = getattr(self, "output_dir", Path("output")) / "barbet-context-vectors.tsv"
+            else:
+                out_ctx_path = Path(context_vector_file)
+                if out_ctx_path.is_dir():
+                    out_ctx_path = out_ctx_path / "barbet-context-vectors.tsv"
+                elif not out_ctx_path.is_absolute() and len(out_ctx_path.parts) == 1:
+                    out_ctx_path = getattr(self, "output_dir", Path("output")) / out_ctx_path
+            out_ctx_path.parent.mkdir(exist_ok=True, parents=True)
+            module.save_context_vectors_tsv(out_ctx_path)
+            self.logger.info(f"Saved context vectors to: '{out_ctx_path}'")
 
         genome_name_set = set(results_df['name'].unique())
 

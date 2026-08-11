@@ -1,4 +1,5 @@
 import gc
+from pathlib import Path
 from torchapp.modules import GeneralLightningModule
 # import pandas as pd
 import polars as pl
@@ -16,7 +17,14 @@ class BarbetLightningModule(GeneralLightningModule):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
 
-    def setup_prediction(self, barbet, names:list[str]|str, threshold:float=0.0, save_probabilities:bool=False):
+    def setup_prediction(
+        self,
+        barbet,
+        names: list[str] | str,
+        threshold: float = 0.0,
+        save_probabilities: bool = False,
+        save_context_vectors: bool = False,
+    ):
         self.names = names
         self.classification_tree = self.hparams.classification_tree
         # self.logits = defaultdict(lambda: 0.0)
@@ -39,13 +47,26 @@ class BarbetLightningModule(GeneralLightningModule):
         self.barbet = barbet
         self.threshold = threshold
         self.save_probabilities = save_probabilities
+        self.save_context_vectors = save_context_vectors
+        self.context_vectors = None
 
     def on_predict_batch_end(self, results, batch, batch_idx, dataloader_idx=0):
         batch_size = len(results)
+        save_ctx = getattr(self, "save_context_vectors", False) and hasattr(self.model, "last_context_vector")
+        if save_ctx:
+            ctx_batch = self.model.last_context_vector.float().cpu()
+            if self.context_vectors is None:
+                self.context_vectors = torch.zeros(
+                    (len(self.name_to_index), ctx_batch.shape[1]),
+                    dtype=torch.float32,
+                )
+
         if isinstance(self.names, str):
             genome_index = self.name_to_index[self.names]
             self.counts[genome_index] += batch_size
             self.logits[genome_index,:] += results.sum(dim=0).half().cpu()
+            if save_ctx:
+                self.context_vectors[genome_index, :] += ctx_batch.sum(dim=0)
         else:
             prev_name = self.names[self.counter]
             start_i = 0
@@ -55,6 +76,8 @@ class BarbetLightningModule(GeneralLightningModule):
                     genome_index = self.name_to_index[prev_name]
                     self.counts[genome_index] += (end_i - start_i)
                     self.logits[genome_index,:] += results[start_i:end_i].sum(dim=0).half().cpu()
+                    if save_ctx:
+                        self.context_vectors[genome_index, :] += ctx_batch[start_i:end_i].sum(dim=0)
                     start_i = end_i
                     prev_name = current_name
             
@@ -63,12 +86,16 @@ class BarbetLightningModule(GeneralLightningModule):
             genome_index = self.name_to_index[prev_name]
             self.logits[genome_index,:] += results[start_i:].sum(dim=0).half().cpu()
             self.counts[genome_index] += (batch_size - start_i)
+            if save_ctx:
+                self.context_vectors[genome_index, :] += ctx_batch[start_i:].sum(dim=0)
             self.counter += batch_size
 
     def on_predict_epoch_end(self):
         print("Consolidating results per genome...")
         names = list(self.name_to_index.keys())
         self.logits /= self.counts.unsqueeze(1)  # Normalize logits by counts
+        if getattr(self, "save_context_vectors", False) and getattr(self, "context_vectors", None) is not None:
+            self.context_vectors /= self.counts.unsqueeze(1)  # Normalize context vectors by counts
         del self.counts
         gc.collect()
 
@@ -173,6 +200,28 @@ class BarbetLightningModule(GeneralLightningModule):
             ).with_columns([
                 pl.col("name").cast(pl.Utf8)
             ]).select(output_columns)
+
+    def save_context_vectors_tsv(self, output_path: str | Path) -> None:
+        import gzip
+        from pathlib import Path
+
+        output_path = Path(output_path)
+        output_path.parent.mkdir(exist_ok=True, parents=True)
+
+        names = list(self.name_to_index.keys())
+        if getattr(self, "context_vectors", None) is None:
+            raise RuntimeError("No context vectors available to save.")
+
+        ctx_vecs = self.context_vectors.detach().cpu().numpy()
+
+        is_gz = str(output_path).endswith(".gz")
+        open_fn = gzip.open if is_gz else open
+
+        with open_fn(output_path, "wt", encoding="utf-8") as f:
+            f.write("name\tcontext_vector\n")
+            for name, vec in zip(names, ctx_vecs):
+                vec_str = ",".join(map(str, vec.tolist()))
+                f.write(f"{name}\t{vec_str}\n")
 
     def generate_top_predictions(self, barbet, num_predictions: int = 1, global_predictions: bool = False) -> pl.DataFrame:
         tree = self.classification_tree

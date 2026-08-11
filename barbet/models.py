@@ -19,6 +19,7 @@ class BarbetModel(nn.Module):
         assert growth_factor > 0.0
         
         self.classification_tree = classification_tree
+        out_features = features
         modules = [nn.LazyLinear(out_features=features), nn.PReLU()]
         for _ in range(intermediate_layers):
             out_features = int(features * growth_factor + 0.5)
@@ -47,6 +48,7 @@ class BarbetModel(nn.Module):
         attention_weights = torch.softmax(attention_scores, dim=1)
 
         context_vector = torch.sum(attention_weights * x, dim=1)
+        self.last_context_vector = context_vector
 
         result = self.classifier(context_vector)
 

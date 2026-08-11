@@ -53,7 +53,14 @@ class MockCheckpoint():
     def hparams(self):
         return MockHParams()
 
-    def setup_prediction(self, barbet, names:list[str]|str, threshold:float=0.0, save_probabilities:bool=False):
+    def setup_prediction(
+        self,
+        barbet,
+        names: list[str] | str,
+        threshold: float = 0.0,
+        save_probabilities: bool = False,
+        save_context_vectors: bool = False,
+    ):
         if isinstance(names, str):
             names = [names]
         unique_names = list(dict.fromkeys(names))
@@ -61,6 +68,9 @@ class MockCheckpoint():
         self.classification_tree = self.hparams.classification_tree
         non_root_nodes = [node for node in self.classification_tree.node_list_softmax if not node.is_root]
         self.probabilities = torch.ones((len(unique_names), len(non_root_nodes))) * 0.2
+        self.save_context_vectors = save_context_vectors
+        if save_context_vectors:
+            self.context_vectors = torch.ones((len(unique_names), 3072), dtype=torch.float32) * 0.5
         self.results_df = pl.DataFrame(
             {
                 "name": unique_names,
@@ -69,8 +79,11 @@ class MockCheckpoint():
             }
         )
 
-    def generate_top_predictions(self, barbet, num_predictions: int = 1):
-        return BarbetLightningModule.generate_top_predictions(self, barbet, num_predictions=num_predictions)
+    def generate_top_predictions(self, barbet, num_predictions: int = 1, global_predictions: bool = False):
+        return BarbetLightningModule.generate_top_predictions(self, barbet, num_predictions=num_predictions, global_predictions=global_predictions)
+
+    def save_context_vectors_tsv(self, output_path: str | Path) -> None:
+        BarbetLightningModule.save_context_vectors_tsv(self, output_path)
 
 
 @pytest.mark.parametrize("k", [1,2])
@@ -464,3 +477,110 @@ def test_generate_top_predictions_global_mode_single_child(tmp_path):
     assert a_only_rows["joint_probability"][0] == pytest.approx(0.80, abs=1e-4)
     assert a_only_rows["in_predicted_lineage"][0] is True
     assert a_only_rows["prediction_number"][0] == 1
+
+
+def test_predict_context_vector_file(tmp_path):
+    barbet = Barbet()
+    barbet.load_checkpoint = lambda *args, **kwargs: MockCheckpoint()
+    barbet.prediction_trainer = lambda *args, **kwargs: MockPredictionTrainer()
+
+    output_dir = tmp_path / "output"
+    input_file = tmp_path / "0.fa.gz"
+    input_file.write_bytes((TEST_DATA_DIR / "MAG-GUT41.fa.gz").read_bytes())
+
+    out_ctx_tsv = output_dir / "context_vectors.tsv"
+    results = barbet.predict(
+        input=[input_file],
+        output_dir=output_dir,
+        context_vector_file=out_ctx_tsv,
+    )
+
+    assert out_ctx_tsv.exists()
+    lines = out_ctx_tsv.read_text(encoding="utf-8").strip().split("\n")
+    assert lines[0] == "name\tcontext_vector"
+    assert len(lines) > 1
+    parts = lines[1].split("\t")
+    assert len(parts) == 2
+    vec_vals = [float(x) for x in parts[1].split(",")]
+    assert len(vec_vals) == 3072
+    assert all(v == 0.5 for v in vec_vals)
+
+
+def test_predict_context_vector_file_gz(tmp_path):
+    import gzip
+
+    barbet = Barbet()
+    barbet.load_checkpoint = lambda *args, **kwargs: MockCheckpoint()
+    barbet.prediction_trainer = lambda *args, **kwargs: MockPredictionTrainer()
+
+    output_dir = tmp_path / "output"
+    input_file = tmp_path / "0.fa.gz"
+    input_file.write_bytes((TEST_DATA_DIR / "MAG-GUT41.fa.gz").read_bytes())
+
+    out_ctx_tsv_gz = output_dir / "context_vectors.tsv.gz"
+    results = barbet.predict(
+        input=[input_file],
+        output_dir=output_dir,
+        context_vector_file=out_ctx_tsv_gz,
+    )
+
+    assert out_ctx_tsv_gz.exists()
+    with gzip.open(out_ctx_tsv_gz, "rt", encoding="utf-8") as f:
+        content = f.read()
+    lines = content.strip().split("\n")
+    assert lines[0] == "name\tcontext_vector"
+    assert len(lines) > 1
+    parts = lines[1].split("\t")
+    assert len(parts) == 2
+    vec_vals = [float(x) for x in parts[1].split(",")]
+    assert len(vec_vals) == 3072
+    assert all(v == 0.5 for v in vec_vals)
+
+
+def test_barbet_lightning_module_context_vector_accumulation(tmp_path):
+    import gzip
+    from hierarchicalsoftmax import SoftmaxNode
+    from barbet.models import BarbetModel
+
+    root = SoftmaxNode('root')
+    curr = root
+    for r in range(6):
+        curr = SoftmaxNode(f'node_{r}', parent=curr)
+    root.set_indexes()
+
+    model = BarbetModel(classification_tree=root, features=16, intermediate_layers=0)
+    lightning_module = BarbetLightningModule(model=model, loss_function=None, max_learning_rate=0.01, metrics=[])
+    lightning_module.hparams.classification_tree = root
+
+    class MockBarbet:
+        def node_to_str(self, node):
+            return str(node)
+
+    names = ["genome_1", "genome_1", "genome_2"]
+    lightning_module.setup_prediction(MockBarbet(), names=names, save_context_vectors=True)
+
+    x1 = torch.randn(2, 32, 16)
+    _ = model(x1)
+    res1 = torch.zeros((2, root.layer_size))
+    lightning_module.on_predict_batch_end(res1, x1, 0)
+
+    x2 = torch.randn(1, 32, 16)
+    _ = model(x2)
+    res2 = torch.zeros((1, root.layer_size))
+    lightning_module.on_predict_batch_end(res2, x2, 1)
+
+    lightning_module.on_predict_epoch_end()
+
+    tsv_path = tmp_path / "out_ctx.tsv.gz"
+    lightning_module.save_context_vectors_tsv(tsv_path)
+
+    with gzip.open(tsv_path, "rt", encoding="utf-8") as f:
+        lines = f.read().strip().split("\n")
+
+    assert lines[0] == "name\tcontext_vector"
+    assert len(lines) == 3
+    g1_parts = lines[1].split("\t")
+    assert g1_parts[0] == "genome_1"
+    g1_vec = [float(v) for v in g1_parts[1].split(",")]
+    assert len(g1_vec) == 16
+
