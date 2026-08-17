@@ -1,12 +1,22 @@
+import sys
+import logging
 from typing import TYPE_CHECKING
 from pathlib import Path
 from enum import Enum
 from collections import defaultdict
-from rich.console import Console
-from rich.progress import track
+import time
+from rich.progress import (
+    Progress,
+    TextColumn,
+    BarColumn,
+    TaskProgressColumn,
+    TimeElapsedColumn,
+    TimeRemainingColumn,
+)
 from torchapp import TorchApp, Param, method, main, tool
 
 from .output import print_polars_df
+from .logging import setup_logger
 
 if TYPE_CHECKING:
     from collections.abc import Iterable
@@ -17,8 +27,6 @@ if TYPE_CHECKING:
     # import pandas as pd
     import polars as pl
 
-
-console = Console()
 
 
 class ImageFormat(str, Enum):
@@ -40,6 +48,24 @@ class ImageFormat(str, Enum):
 
 
 class Barbet(TorchApp):
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+        if hasattr(self, "main_app") and hasattr(self.main_app, "info"):
+            self.main_app.info.context_settings = {"help_option_names": ["-h", "--help"]}
+        if hasattr(self, "tools_app") and hasattr(self.tools_app, "info"):
+            self.tools_app.info.context_settings = {"help_option_names": ["-h", "--help"]}
+
+    @property
+    def logger(self) -> logging.Logger:
+        if not hasattr(self, "_logger") or self._logger is None:
+            output_dir = getattr(self, "output_dir", Path("output"))
+            self._logger = setup_logger(output_dir)
+        return self._logger
+
+    @logger.setter
+    def logger(self, logger: logging.Logger) -> None:
+        self._logger = logger
+
     @method
     def setup(
         self,
@@ -63,7 +89,7 @@ class Barbet(TorchApp):
 
         self.stack_size = stack_size
 
-        print(f"Loading treedict {treedict}")
+        self.logger.info(f"Loading treedict {treedict}")
         individual_treedict = TreeDict.load(treedict)
         self.treedict = TreeDict(
             classification_tree=individual_treedict.classification_tree
@@ -74,7 +100,7 @@ class Barbet(TorchApp):
             for tip in self.treedict.classification_tree.leaves:
                 tip.parent.alpha = tip_alpha
 
-        print("Loading memmap")
+        self.logger.info("Loading memmap")
         self.accession_to_array_index = defaultdict(list)
         with open(memmap_index) as f:
             for key_index, key in enumerate(f):
@@ -197,7 +223,7 @@ class Barbet(TorchApp):
             64, help="The batch size for the prediction dataloader."
         ),
         cpus: int = Param(
-            1, help="The number of CPUs to use for the prediction dataloader."
+            1, param_decls=["--cpus", "-c"], help="The number of CPUs to use for the prediction dataloader."
         ),
         dataloader_workers: int = Param(
             4, help="The number of workers to use for the dataloader."
@@ -206,13 +232,15 @@ class Barbet(TorchApp):
             2,
             help="The minimum number of times to use each protein embedding in the prediction.",
         ),
+        genome_idx: int = Param(1, hidden=True),
+        total_genomes: int = Param(1, hidden=True),
         **kwargs,
     ) -> "Iterable":
         import torch
         import numpy as np
         from torch.utils.data import DataLoader
         from barbet.data import BarbetPredictionDataset
-        
+
         # Set PyTorch thread limits
         torch.set_num_threads(cpus)
        
@@ -229,23 +257,35 @@ class Barbet(TorchApp):
         embeddings = []
         accessions = []
 
-        fastas = markers[domain]
-        for fasta in track(
-            fastas, description="[cyan]Embedding...  ", total=len(fastas)
-        ):
-            # read the fasta file sequence remove the header
-            fasta = Path(fasta)
-            seq = fasta.read_text().split("\n")[1]
-            vector = module.hparams.embedding_model(seq)
-            if vector is not None and not torch.isnan(vector).any():
-                vector = vector.cpu().detach().clone().numpy()
-                embeddings.append(vector)
+        fastas = sorted(markers[domain])  # sort for determinism independent of HMMER output order
+        pct = (genome_idx / total_genomes) * 100 if total_genomes else 100.0
+        description = f"[cyan]Embedding ({genome_idx:,}/{total_genomes:,} genomes, {pct:.1f}%)..."
 
-                gene_family_id = fasta.stem
-                accession = f"{genome_path.stem}/{gene_family_id}"
-                accessions.append(accession)
+        embedding_model = module.hparams.embedding_model
 
-            del vector
+        with Progress(
+            TextColumn("{task.description}"),
+            BarColumn(),
+            TaskProgressColumn(),
+            TimeElapsedColumn(),
+            TimeRemainingColumn(),
+        ) as progress:
+            task = progress.add_task(description, total=len(fastas))
+            for fasta in fastas:
+                # read the fasta file sequence remove the header
+                fasta = Path(fasta)
+                seq = fasta.read_text().split("\n")[1]
+                vector = embedding_model(seq)
+                if vector is not None and not torch.isnan(vector).any():
+                    vector = vector.cpu().detach().clone().numpy()
+                    embeddings.append(vector)
+
+                    gene_family_id = fasta.stem
+                    accession = f"{genome_path.name}/{gene_family_id}"
+                    accessions.append(accession)
+
+                del vector
+                progress.advance(task)
 
         embeddings = np.asarray(embeddings).astype(np.float16)
 
@@ -280,75 +320,168 @@ class Barbet(TorchApp):
         self,
         input: list[Path] = Param(
             default=...,
-            help="FASTA files or directories of FASTA files. Requires genome in an individual FASTA file."
+            param_decls=["--input", "-i"],
+            help="FASTA files, directories of FASTA files, or a TSV file (columns: fasta_path, [genome_id], [translation_table]). Requires genomes to be in individual FASTA file."
         ),
-        output_dir: Path = Param("output", help="A path to the output directory."),
+        output_dir: Path = Param(
+            default="output",
+            param_decls=["--output-dir", "-o"], 
+            help="A path to the output directory."
+        ),
         output_csv: Path = Param(
-            default=None, help="A path to output the results as a CSV."
+            default=None, 
+            help="A path to output the results as a CSV."
+        ),
+        rm_intermediate: bool = Param(
+            default=False, 
+            help="If set, remove the intermediate results directory after processing."
         ),
         cpus: int = Param(
-            1, help="The number of CPUs to use."
+            default=1, 
+            param_decls=["--cpus", "-c"], 
+            help="The number of CPUs to use."
         ),
         pfam_db: str = Param(
-            "https://data.ace.uq.edu.au/public/gtdbtk/release95/markers/pfam/Pfam-A.hmm",
+            default="https://data.ace.uq.edu.au/public/gtdbtk/release95/markers/pfam/Pfam-A.hmm",
             help="The Pfam database to use.",
         ),
         tigr_db: str = Param(
-            "https://data.ace.uq.edu.au/public/gtdbtk/release95/markers/tigrfam/tigrfam.hmm",
+            default="https://data.ace.uq.edu.au/public/gtdbtk/release95/markers/tigrfam/tigrfam.hmm",
             help="The TIGRFAM database to use.",
         ),
         **kwargs,
     ):
         """Barbet is a tool for assigning taxonomic labels to genomes using Machine Learning."""
+        start_time = time.perf_counter()
+        self.start_time = start_time
+        self.output_dir = Path(output_dir)
+        self.logger = setup_logger(self.output_dir)
+
         # import pandas as pd
         import polars as pl
         from itertools import chain
         from barbet.markers import extract_markers_genes
 
-        # Get list of files
+        # Get list of files & metadata
         files = []
+        genome_id_map = {}  # str(file_path) -> genome_id
+        translation_tables = {}  # genome_id -> translation_table (int)
+
         if isinstance(input, (str, Path)):
-            input = [input]
+            input = [Path(input)]
+        else:
+            input = [Path(p) for p in input]
+
         assert len(input) > 0, "No input files provided."
-        for path in input:
-            if path.is_dir():
-                for file in chain(
-                    path.rglob("*.fa"),
-                    path.rglob("*.fasta"),
-                    path.rglob("*.fna"),
-                    path.rglob("*.fa.gz"),
-                    path.rglob("*.fasta.gz"),
-                    path.rglob("*.fna.gz"),
-                ):
-                    files.append(file)
-            elif path.is_file():
-                files.append(path)
+
+        def _is_tsv_file(p: Path) -> bool:
+            if not p.is_file():
+                return False
+            if p.suffix.lower() in (".tsv", ".tab"):
+                return True
+            if p.suffix.lower() in (".fa", ".fasta", ".fna", ".gz"):
+                return False
+            try:
+                with open(p, "r", encoding="utf-8") as f:
+                    first_line = f.readline()
+                    if first_line and not first_line.startswith(">") and "\t" in first_line:
+                        return True
+            except Exception:
+                pass
+            return False
+
+        if len(input) == 1 and _is_tsv_file(input[0]):
+            tsv_path = input[0]
+            with open(tsv_path, "r", encoding="utf-8") as f:
+                for line_idx, line in enumerate(f, start=1):
+                    line_str = line.strip()
+                    if not line_str or line_str.startswith("#"):
+                        continue
+                    parts = [p.strip() for p in line_str.split("\t")]
+                    if not parts or not parts[0]:
+                        continue
+
+                    fasta_str = parts[0]
+                    fasta_path = Path(fasta_str)
+
+                    # Skip header line if col1 looks like header and file doesn't exist
+                    if line_idx == 1 and not fasta_path.exists():
+                        col1_lower = fasta_str.lower()
+                        if col1_lower in ("path", "fasta", "fasta_path", "file", "genome_path", "genome") or "fasta" in col1_lower or "path" in col1_lower:
+                            continue
+
+                    if not fasta_path.exists():
+                        raise FileNotFoundError(f"FASTA file specified in TSV does not exist: {fasta_str}")
+
+                    files.append(fasta_path)
+
+                    col2 = parts[1] if len(parts) > 1 and parts[1] else None
+                    gid = col2 if col2 else fasta_path.name
+                    genome_id_map[str(fasta_path)] = gid
+
+                    if len(parts) > 2 and parts[2]:
+                        raw_tt = parts[2]
+                        try:
+                            tt = int(raw_tt)
+                        except ValueError:
+                            raise ValueError(
+                                f"Invalid translation table '{raw_tt}' at line {line_idx} in {tsv_path}. Must be 4, 11, or 25."
+                            )
+                        if tt not in (4, 11, 25):
+                            raise ValueError(
+                                f"Invalid translation table '{tt}' at line {line_idx} in {tsv_path}. Must be either 4, 11, or 25."
+                            )
+                        translation_tables[gid] = tt
+        else:
+            for path in input:
+                if path.is_dir():
+                    for file in chain(
+                        path.rglob("*.fa"),
+                        path.rglob("*.fasta"),
+                        path.rglob("*.fna"),
+                        path.rglob("*.fa.gz"),
+                        path.rglob("*.fasta.gz"),
+                        path.rglob("*.fna.gz"),
+                    ):
+                        files.append(file)
+                        genome_id_map[str(file)] = file.name
+                elif path.is_file():
+                    files.append(path)
+                    genome_id_map[str(path)] = path.name
 
         # Check if any files were found
         if len(files) == 0:
             raise ValueError(
-                f"No files found in {input}. Please provide a directory or a list of files."
+                f"No files found in {input}. Please provide a directory, a list of files, or a TSV file."
             )
 
         # Check if output directory exists
-        self.output_dir = Path(output_dir)
         output_csv = output_csv or self.output_dir / "barbet-predictions.csv"
         output_csv = Path(output_csv)
         output_csv.parent.mkdir(exist_ok=True, parents=True)
-        console.print(
+        self.logger.info(
             f"Writing results for {len(files)} genome{'s' if len(files) > 1 else ''} to '{output_csv}'"
         )
+
+        results_dir = self.output_dir / "results"
+        results_dir.mkdir(exist_ok=True, parents=True)
 
         ####################
         # Extract single copy marker genes
         ####################
+        start_time_markers = time.perf_counter()
         markers_gene_map = extract_markers_genes(
-            genomes={file.stem: str(file) for file in files},
-            out_dir=str(self.output_dir),
+            genomes={genome_id_map[str(file)]: str(file) for file in files},
+            out_dir=str(results_dir),
             cpus=cpus,
             force=True,
             pfam_db=self.process_location(pfam_db),
             tigr_db=self.process_location(tigr_db),
+            translation_tables=translation_tables if translation_tables else None,
+        )
+        extract_markers_time = time.perf_counter() - start_time_markers
+        self.logger.info(
+            f"Total time to extract and identify marker genes: {extract_markers_time:.2f} seconds"
         )
 
         # Load the model
@@ -357,29 +490,84 @@ class Barbet(TorchApp):
 
         # Make predictions for each file
         total_df = None
-        for genome_path, maker_genes in markers_gene_map.items():
-            genome_path = Path(genome_path)
-            prediction_dataloader = self.prediction_dataloader(module, genome_path, maker_genes, cpus=cpus, **kwargs)
-            module.setup_prediction(self, genome_path.name)
-            trainer.predict(module, dataloaders=prediction_dataloader)
-            results_df = module.results_df
+        total_genomes = len(markers_gene_map)
+        kwargs_dataloader = dict(kwargs)
+        kwargs_dataloader.pop("genome_idx", None)
+        kwargs_dataloader.pop("total_genomes", None)
 
-            if total_df is None:
-                total_df = results_df
-                if output_csv:
-                    results_df.write_csv(output_csv)
-            else:
-                total_df = pl.concat([total_df, results_df], how="vertical")
+        stack_size = module.hparams.get("stack_size", 32)
+        repeats = kwargs.get("repeats", 2)
+        batch_size = kwargs.get("batch_size", 64)
+        dataloader_workers = kwargs.get("dataloader_workers", 4)
 
-                if output_csv:
-                    with open(output_csv, mode="a") as f:
-                        results_df.write_csv(f, include_header=False)
+        start_time_embed_classify = time.perf_counter()
 
-        print_polars_df(
-            total_df[["name", "species_prediction", "species_probability", ]],
-            column_names=["Genome", "Species", "Probability"],
+        all_embeddings_list = []
+        all_accessions = []
+
+        for idx, (gid, maker_genes) in enumerate(markers_gene_map.items(), start=1):
+            genome_path = Path(gid)
+            self.prediction_dataloader(
+                module,
+                genome_path,
+                maker_genes,
+                cpus=cpus,
+                genome_idx=idx,
+                total_genomes=total_genomes,
+                **kwargs_dataloader,
+            )
+            if len(self.prediction_dataset.array) > 0:
+                all_embeddings_list.append(self.prediction_dataset.array)
+                all_accessions.extend(self.prediction_dataset.accessions)
+
+        if all_embeddings_list:
+            import numpy as np
+            from torch.utils.data import DataLoader
+            from barbet.data import BarbetPredictionDataset
+
+            all_embeddings_arr = np.concatenate(all_embeddings_list, axis=0)
+            self.prediction_dataset = BarbetPredictionDataset(
+                array=all_embeddings_arr,
+                accessions=all_accessions,
+                stack_size=stack_size,
+                repeats=repeats,
+                seed=42,
+            )
+            combined_dataloader = DataLoader(
+                self.prediction_dataset,
+                batch_size=batch_size,
+                num_workers=dataloader_workers,
+                shuffle=False,
+            )
+            names = [stack.genome for stack in self.prediction_dataset.stacks]
+            module.setup_prediction(self, names)
+            trainer.predict(module, dataloaders=combined_dataloader)
+            total_df = module.results_df
+
+        embed_classify_time = time.perf_counter() - start_time_embed_classify
+        self.logger.info(
+            f"Total time to embed and classify: {embed_classify_time:.2f} seconds"
         )
-        console.print(f"Saved to: '{output_csv}'")
+
+        if total_df is not None:
+            if output_csv:
+                total_df.write_csv(output_csv)
+
+            print_polars_df(
+                total_df[["name", "species_prediction", "species_probability", ]],
+                column_names=["Genome", "Species", "Probability"],
+            )
+            self.logger.info(f"Saved to: '{output_csv}'")
+        else:
+            self.logger.warning("No predictions were generated.")
+
+        if rm_intermediate and results_dir.exists():
+            import shutil
+            shutil.rmtree(results_dir)
+
+        total_time = time.perf_counter() - start_time
+        self.logger.info(f"Total time: {total_time:.2f} seconds")
+        self.logger.info("Done")
         return total_df
 
     @tool(
@@ -399,6 +587,8 @@ class Barbet(TorchApp):
         **kwargs,
     ):
         """Barbet is a tool for assigning taxonomic labels to genomes using Machine Learning."""
+        start_time = time.perf_counter()
+        self.start_time = start_time
         module = self.load_checkpoint(**kwargs)
         trainer = self.prediction_trainer(module, **kwargs)
         prediction_dataloader = self.prediction_dataloader_memmap(module, **kwargs)
@@ -416,7 +606,7 @@ class Barbet(TorchApp):
 
             true_values = defaultdict(dict)
 
-            console.print(f"Adding true values from TreeDict '{treedict}'")
+            self.logger.info(f"Adding true values from TreeDict '{treedict}'")
             treedict = TreeDict.load(treedict)
             
             # Get lineage to map
@@ -434,10 +624,14 @@ class Barbet(TorchApp):
                     pl.col("name").map_elements(true_values[rank].get, return_dtype=pl.Utf8).alias(f"{rank}_true")
                 )
     
-        console.print(f"Writing to '{output_csv}'")
+        self.logger.info(f"Writing to '{output_csv}'")
         output_csv = Path(output_csv)
         output_csv.parent.mkdir(exist_ok=True, parents=True)
         results_df.write_csv(output_csv)
+
+        total_time = time.perf_counter() - start_time
+        self.logger.info(f"Total time: {total_time:.2f} seconds")
+        self.logger.info("Done")
 
         return results_df
     
@@ -468,13 +662,13 @@ class Barbet(TorchApp):
         assert memmap_index.exists(), f"Memmap index file does not exist: {memmap_index}"
 
         # Read the memmap array index
-        console.print(f"Reading memmap array index '{memmap_index}'")
+        self.logger.info(f"Reading memmap array index '{memmap_index}'")
         accessions = memmap_index.read_text().strip().split("\n")
         count = len(accessions)
-        console.print(f"Found {count} accessions")
+        self.logger.info(f"Found {count} accessions")
 
         # Load the memmap array itself
-        console.print(f"Loading memmap array '{memmap}'")
+        self.logger.info(f"Loading memmap array '{memmap}'")
         array = read_memmap(memmap, count)
 
         # Get hyperparameters from checkpoint
@@ -540,4 +734,3 @@ class Barbet(TorchApp):
         
         # barbet-bac120-ESM6-base.ckpt
         return "https://figshare.unimelb.edu.au/ndownloader/files/56307671"
-

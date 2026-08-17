@@ -162,6 +162,10 @@ class Embedding(CLIApp, ABC):
 
     def __post_init__(self):
         super().__init__()
+        if hasattr(self, "main_app") and hasattr(self.main_app, "info"):
+            self.main_app.info.context_settings = {"help_option_names": ["-h", "--help"]}
+        if hasattr(self, "tools_app") and hasattr(self.tools_app, "info"):
+            self.tools_app.info.context_settings = {"help_option_names": ["-h", "--help"]}
 
     @abstractmethod
     def embed(self, seq:str) -> torch.Tensor:
@@ -206,7 +210,7 @@ class Embedding(CLIApp, ABC):
         tensor = tensor/weights.unsqueeze(1)
 
         return self.reduce(tensor)
-    
+
     @method
     def setup(self, **kwargs):
         pass

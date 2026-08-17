@@ -66,9 +66,9 @@ class BarbetPredictionDataset(Dataset):
             genome_to_array_indices[genome].add(index)
 
         # Build stacks
-        random.seed(self.seed)
         self.stacks = []
         for genome, genome_array_indices in genome_to_array_indices.items():
+            random.seed(self.seed)
             stack_indices = []
             remainder = []
             for repeat_index in range(self.repeats + 1):
@@ -79,7 +79,7 @@ class BarbetPredictionDataset(Dataset):
                 genome_array_indices_set = set(genome_array_indices)
                 available = genome_array_indices_set - set(remainder)
                 needed = self.stack_size - len(remainder)
-                available_list = list(available)
+                available_list = sorted(available)  # sort for determinism independent of PYTHONHASHSEED
 
                 if len(available_list) >= needed:
                     to_add = random.sample(available_list, needed)  # without replacement
@@ -89,7 +89,7 @@ class BarbetPredictionDataset(Dataset):
                 assert not set(remainder) & to_add_set, "remainder and to_add should be disjoint"
 
                 self.add_stack(genome, remainder + to_add)
-                remainder = list(genome_array_indices_set - to_add_set)
+                remainder = sorted(genome_array_indices_set - to_add_set)  # sort before shuffle for determinism
                 random.shuffle(remainder)
 
                 # If we have already added each item the required number of times, then stop

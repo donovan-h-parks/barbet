@@ -1,6 +1,6 @@
 import os
 import subprocess
-from typing import Dict, List, Tuple
+from typing import Dict, List, Tuple, Optional
 import gzip
 import shutil
 import tempfile
@@ -233,7 +233,8 @@ def run_prodigal(
     genome_id: str,
     fasta_path: str,
     out_dir: str,
-    force: bool
+    force: bool,
+    translation_table: Optional[int] = None,
 ) -> str:
     """
     Run Prodigal to predict protein-coding genes from a FASTA file.
@@ -247,6 +248,8 @@ def run_prodigal(
         Directory where the output protein FASTA file will be saved.
     force : bool
         If True, overwrite existing output files.
+    translation_table : Optional[int]
+        Translation table to pass to Prodigal via -g flag (e.g., 4, 11, 25).
     progress_dict : Dict
         Shared dictionary to track progress across multiple processes.
     task_id : int
@@ -274,8 +277,12 @@ def run_prodigal(
         input_path = fasta_path
 
     # Run Prodigal
+    cmd = ["prodigal", "-a", prot_fa, "-p", "meta", "-i", input_path]
+    if translation_table is not None:
+        cmd.extend(["-g", str(translation_table)])
+
     subprocess.run(
-        ["prodigal", "-a", prot_fa, "-p", "meta", "-i", input_path],
+        cmd,
         check=True,
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL,
@@ -339,7 +346,7 @@ def parse_domtblout_top_hits(domtbl_path: str) -> Dict[str, List[str]]:
     hits: Dict[str, List[str]] = {}
     for seq_id, (hmm_id, _, _) in seq_matches.items():
         hits.setdefault(hmm_id, []).append(seq_id)
-    return hits
+    return {hmm: sorted(seq_list) for hmm, seq_list in hits.items()}
 
 
 def _process_single_genome(
@@ -379,7 +386,10 @@ def _process_single_genome(
         number_of_hits_to_keep,
         progress_dict,
         task_id,
+        *rest,
     ) = args
+
+    translation_table = rest[0] if rest else None
 
     genome_fastas: Dict[str, List[str]] = {"bac120": [], "ar53": []}
 
@@ -387,7 +397,7 @@ def _process_single_genome(
     progress_dict[task_id] = {"progress": 0}
 
     # Prodigal
-    prot_fa = run_prodigal(gid, path, out_dir, force)
+    prot_fa = run_prodigal(gid, path, out_dir, force, translation_table=translation_table)
     prot_seqs = read_fasta(prot_fa)
     # Signal to the shared dict that we've completed step 1 (Prodigal)
     progress_dict[task_id] = {"progress": 1}
@@ -447,7 +457,7 @@ def _process_single_genome(
     tg_hits = parse_domtblout_top_hits(tg_out)
     combined_hits = {**pf_hits, **tg_hits}
 
-    for marker, seq_ids in combined_hits.items():
+    for marker, seq_ids in sorted(combined_hits.items()):
         if not seq_ids:
             continue
         elif len(seq_ids) == 1:
@@ -457,7 +467,7 @@ def _process_single_genome(
             if len(unique_seqs) != 1 and skip_multiple_hits:
                 # faster but can miss some markers
                 continue
-            seqs = list(unique_seqs)[:number_of_hits_to_keep]
+            seqs = sorted(unique_seqs)[:number_of_hits_to_keep]
 
         for dom in ("bac120", "ar53"):
             if (dom == "bac120" and marker in BAC120_MARKERS) or (
@@ -485,6 +495,7 @@ def extract_markers_genes(
     force: bool = False,
     skip_multiple_hits: bool = False,
     number_of_hits_to_keep: int = 1,
+    translation_tables: Optional[Dict[str, int]] = None,
 ) -> Dict[str, Dict[str, List[str]]]:
     """
     Extract marker genes from multiple genomes in parallel using Prodigal and HMMER. 
@@ -529,6 +540,7 @@ def extract_markers_genes(
         with ProcessPoolExecutor(max_workers=n_workers) as executor:
             for gid, fasta_path in genomes.items():
                 task_id = genome_to_task[gid]
+                trans_table = translation_tables.get(gid) if translation_tables else None
                 args = (
                     gid,
                     fasta_path,
@@ -541,6 +553,7 @@ def extract_markers_genes(
                     number_of_hits_to_keep,
                     progress_dict,
                     task_id,
+                    trans_table,
                 )
                 future = executor.submit(_process_single_genome, args)
                 futures_to_task[future] = (task_id, fasta_path)
@@ -589,5 +602,5 @@ def extract_markers_genes(
             # Ensure we update the overall task to the final count
             rich_progress.update(overall_task, completed=n_genomes)
 
-    return results
+    return {gid: results[fasta_path] for gid, fasta_path in genomes.items() if fasta_path in results}
 
