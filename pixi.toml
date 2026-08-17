@@ -1,4 +1,4 @@
-[project]
+[workspace]
 authors = ["Wytamma Wirth <wytamma.wirth@me.com>"]
 channels = ["conda-forge", "bioconda"]
 name = "barbet"
