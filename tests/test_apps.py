@@ -7,6 +7,7 @@ from hierarchicalsoftmax import SoftmaxNode
 from barbet import Barbet
 from barbet.embedding import Embedding
 from barbet.modules import BarbetLightningModule
+from barbet.data import RANKS
 
 
 TEST_DATA_DIR = Path(__file__).parent / "data"
@@ -60,6 +61,7 @@ class MockCheckpoint():
         threshold: float = 0.0,
         save_probabilities: bool = False,
         save_context_vectors: bool = False,
+        retain_probabilities: bool = False,
     ):
         if isinstance(names, str):
             names = [names]
@@ -479,6 +481,59 @@ def test_generate_top_predictions_global_mode_single_child(tmp_path):
     assert a_only_rows["prediction_number"][0] == 1
 
 
+def test_generate_top_predictions_global_mode_ranks_only_children(tmp_path):
+    """In global mode, only children (absent from node_list_softmax) are ranked with
+    the probability of their parent, even when they are not on the greedy path.
+
+    Tree:
+        root
+        ├── A        (depth 1)
+        │   ├── A1   (depth 2)
+        │   └── A2   (depth 2)
+        └── B        (depth 1, has 1 child)
+            └── B_only  (depth 2, single child, NOT in node_list_softmax)
+
+    With A=0.6 (A1=0.35, A2=0.25) and B=0.4 the greedy path is A → A1, but globally
+    B_only (0.4) is the most probable class.
+    """
+    root        = SoftmaxNode("root")
+    node_a      = SoftmaxNode("A",      parent=root)
+    node_a1     = SoftmaxNode("A1",     parent=node_a)
+    node_a2     = SoftmaxNode("A2",     parent=node_a)
+    node_b      = SoftmaxNode("B",      parent=root)
+    node_b_only = SoftmaxNode("B_only", parent=node_b)
+    root.set_indexes()
+    assert node_b_only not in set(root.node_list_softmax)
+
+    class MockBarbet5:
+        def node_to_str(self, node):
+            return node.name
+
+    non_root = [n for n in root.node_list_softmax if not n.is_root]
+    node_idx = {n: i for i, n in enumerate(non_root)}
+    probs = torch.zeros((1, len(non_root)))
+    probs[0, node_idx[node_a]]  = 0.60
+    probs[0, node_idx[node_b]]  = 0.40
+    probs[0, node_idx[node_a1]] = 0.35
+    probs[0, node_idx[node_a2]] = 0.25
+
+    class MockModule5:
+        name_to_index       = {"genome1": 0}
+        classification_tree = root
+        probabilities       = probs
+
+    df = BarbetLightningModule.generate_top_predictions(
+        MockModule5(), MockBarbet5(), num_predictions=3, global_predictions=True
+    )
+    class_df = df.filter(pl.col("rank") == "class")
+
+    assert class_df["taxon"].to_list() == ["B_only", "A1", "A2"]
+    assert class_df["prediction_number"].to_list() == [1, 2, 3]
+    assert class_df["joint_probability"].to_list() == pytest.approx([0.40, 0.35, 0.25], abs=1e-6)
+    assert class_df["local_probability"].to_list() == pytest.approx([1.0, 0.35 / 0.60, 0.25 / 0.60], abs=1e-6)
+    assert class_df["in_predicted_lineage"].to_list() == [False, True, False]
+
+
 def test_predict_context_vector_file(tmp_path):
     barbet = Barbet()
     barbet.load_checkpoint = lambda *args, **kwargs: MockCheckpoint()
@@ -584,3 +639,167 @@ def test_barbet_lightning_module_context_vector_accumulation(tmp_path):
     g1_vec = [float(v) for v in g1_parts[1].split(",")]
     assert len(g1_vec) == 16
 
+
+
+def _run_epoch_end(**setup_kwargs):
+    """Run BarbetLightningModule.on_predict_epoch_end on fixed logits for a tree
+    containing both multi-child and single-child nodes."""
+    from barbet.models import BarbetModel
+
+    root = SoftmaxNode("root")
+    for p in range(2):
+        phylum = SoftmaxNode(f"p{p}", parent=root)
+        parent = phylum
+        for rank in ["c", "o", "f", "g"]:
+            parent = SoftmaxNode(f"{parent.name}_{rank}", parent=parent)  # single child
+        for s in range(3):
+            SoftmaxNode(f"{parent.name}_s{s}", parent=parent)
+    root.set_indexes()
+
+    model = BarbetModel(classification_tree=root, features=16, intermediate_layers=0)
+    module = BarbetLightningModule(model=model, loss_function=None, max_learning_rate=0.01, metrics=[])
+    module.hparams.classification_tree = root
+
+    class MockBarbet:
+        def node_to_str(self, node):
+            return node.name
+
+    names = [f"genome_{i}" for i in range(4)]
+    module.setup_prediction(MockBarbet(), names=names, **setup_kwargs)
+    module.on_predict_batch_end(torch.randn((4, root.layer_size), generator=torch.Generator().manual_seed(0)), None, 0)
+    module.on_predict_epoch_end()
+    category_names = [n.name for n in root.node_list_softmax if not n.is_root]
+    return module, category_names
+
+
+def test_save_probabilities_includes_node_columns():
+    """Regression test: save_probabilities (predict_memmap --probabilities) must include a
+    probability column for every node in the taxonomy."""
+    module, category_names = _run_epoch_end(save_probabilities=True)
+    columns = module.results_df.columns
+    assert columns[:13] == ["name"] + [f"{r}_{c}" for r in RANKS for c in ("prediction", "probability")]
+    assert columns[13:] == category_names
+
+
+def test_retain_probabilities_does_not_change_results():
+    """retain_probabilities (used by --output-predictions) keeps the probability matrix
+    without changing barbet-predictions.csv."""
+    baseline, _ = _run_epoch_end()
+    retained, category_names = _run_epoch_end(retain_probabilities=True)
+
+    assert baseline.probabilities is None
+    assert retained.probabilities is not None
+    assert tuple(retained.probabilities.shape) == (4, len(category_names))
+    assert retained.results_df.equals(baseline.results_df)
+
+
+@pytest.mark.parametrize(
+    "path, expected",
+    [
+        (True, "out/default.tsv"),
+        ("true", "out/default.tsv"),
+        ("1", "out/default.tsv"),
+        ("existing_dir", "existing_dir/default.tsv"),
+        ("preds.tsv", "out/preds.tsv"),
+        ("sub/preds.tsv", "sub/preds.tsv"),
+    ],
+)
+def test_resolve_output_path(path, expected, tmp_path, monkeypatch):
+    from barbet.apps import resolve_output_path
+
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / "existing_dir").mkdir()
+
+    resolved = resolve_output_path(path, Path("out"), "default.tsv")
+
+    assert resolved == Path(expected)
+    assert resolved.parent.is_dir()
+
+
+def test_resolve_output_path_absolute(tmp_path):
+    from barbet.apps import resolve_output_path
+
+    path = tmp_path / "nested" / "preds.tsv"
+    assert resolve_output_path(path, tmp_path / "out", "default.tsv") == path
+    assert path.parent.is_dir()
+
+
+def test_model_forward_does_not_store_context_vector():
+    """Regression test: BarbetModel.forward must not keep the context vector on the model. The whole
+    model is pickled into checkpoints, and deepcopy fails for a stored non-leaf tensor after a
+    training step."""
+    import copy
+    from barbet.models import BarbetModel
+
+    root = SoftmaxNode("root")
+    for i in range(3):
+        SoftmaxNode(f"n{i}", parent=root)
+    root.set_indexes()
+
+    model = BarbetModel(classification_tree=root, features=16, intermediate_layers=0)
+    model.train()
+    model(torch.randn(2, 4, 8)).sum().backward()
+
+    assert not any(torch.is_tensor(value) for value in vars(model).values())
+    copy.deepcopy(model)
+
+
+def test_context_vector_hook_captures_classifier_input_and_is_removed():
+    from barbet.models import BarbetModel
+
+    # on_predict_epoch_end requires a lineage for every rank
+    root = SoftmaxNode("root")
+    for p in range(2):
+        parent = SoftmaxNode(f"p{p}", parent=root)
+        for rank in ["c", "o", "f", "g", "s"]:
+            parent = SoftmaxNode(f"{parent.name}_{rank}", parent=parent)
+    root.set_indexes()
+
+    model = BarbetModel(classification_tree=root, features=16, intermediate_layers=0)
+    module = BarbetLightningModule(model=model, loss_function=None, max_learning_rate=0.01, metrics=[])
+    module.hparams.classification_tree = root
+
+    class MockBarbet:
+        def node_to_str(self, node):
+            return node.name
+
+    def context_vector(x):
+        # Same calculation as BarbetModel.forward up to the classification layer
+        x = model.sequential(x)
+        attention_weights = torch.softmax(model.attention_layer(x), dim=1)
+        return torch.sum(attention_weights * x, dim=1)
+
+    x = torch.randn(3, 4, 8)
+    model.eval()
+    with torch.no_grad():
+        model(x)  # initialise the lazy layers
+        module.setup_prediction(MockBarbet(), names=["g1", "g1", "g2"], save_context_vectors=True)
+        results = model(x)
+        module.on_predict_batch_end(results, x, 0)
+        module.on_predict_epoch_end()
+        expected = context_vector(x)
+
+    assert torch.allclose(module.context_vectors[0], expected[:2].mean(dim=0), atol=1e-6)
+    assert torch.allclose(module.context_vectors[1], expected[2], atol=1e-6)
+    assert len(model.classifier._forward_pre_hooks) == 0
+
+
+def test_predict_writes_results_before_optional_outputs(tmp_path):
+    """barbet-predictions.csv must be written even if writing an optional output fails."""
+
+    class FailingCheckpoint(MockCheckpoint):
+        def save_context_vectors_tsv(self, output_path):
+            raise RuntimeError("cannot write context vectors")
+
+    barbet = Barbet()
+    barbet.load_checkpoint = lambda *args, **kwargs: FailingCheckpoint()
+    barbet.prediction_trainer = lambda *args, **kwargs: MockPredictionTrainer()
+
+    output_dir = tmp_path / "output"
+    input_file = tmp_path / "0.fa.gz"
+    input_file.write_bytes((TEST_DATA_DIR / "MAG-GUT41.fa.gz").read_bytes())
+
+    with pytest.raises(RuntimeError, match="cannot write context vectors"):
+        barbet.predict(input=[input_file], output_dir=output_dir, context_vector_file="ctx.tsv")
+
+    assert (output_dir / "barbet-predictions.csv").exists()

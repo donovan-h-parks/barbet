@@ -2,6 +2,7 @@ import gc
 from pathlib import Path
 from torchapp.modules import GeneralLightningModule
 # import pandas as pd
+import numpy as np
 import polars as pl
 import torch
 from collections import defaultdict
@@ -24,7 +25,15 @@ class BarbetLightningModule(GeneralLightningModule):
         threshold: float = 0.0,
         save_probabilities: bool = False,
         save_context_vectors: bool = False,
+        retain_probabilities: bool = False,
     ):
+        """
+        Args:
+            save_probabilities: Include a probability column for every node in the taxonomy in `results_df`.
+            save_context_vectors: Accumulate the mean-pooled context vector for each genome.
+            retain_probabilities: Keep the (genomes x nodes) probability matrix in `self.probabilities` for
+                `generate_top_predictions` without changing the columns or calculation of `results_df`.
+        """
         self.names = names
         self.classification_tree = self.hparams.classification_tree
         # self.logits = defaultdict(lambda: 0.0)
@@ -47,14 +56,39 @@ class BarbetLightningModule(GeneralLightningModule):
         self.barbet = barbet
         self.threshold = threshold
         self.save_probabilities = save_probabilities
+        self.retain_probabilities = retain_probabilities
+        self.probabilities = None
         self.save_context_vectors = save_context_vectors
         self.context_vectors = None
 
+        self._remove_context_vector_hook()
+        if save_context_vectors:
+            classifier = getattr(self.model, "classifier", None)
+            if classifier is None:
+                raise RuntimeError("Cannot save context vectors: the model has no 'classifier' layer.")
+            # The context vector is the input to the classification layer. It is captured with a hook
+            # that only exists during prediction so that nothing is stored on the model during training.
+            self._context_vector_hook = classifier.register_forward_pre_hook(self._capture_context_vector)
+
+    def _capture_context_vector(self, module, args):
+        self._last_context_vector = args[0].detach()
+
+    def _remove_context_vector_hook(self):
+        hook = getattr(self, "_context_vector_hook", None)
+        if hook is not None:
+            hook.remove()
+        self._context_vector_hook = None
+        self._last_context_vector = None
+
     def on_predict_batch_end(self, results, batch, batch_idx, dataloader_idx=0):
         batch_size = len(results)
-        save_ctx = getattr(self, "save_context_vectors", False) and hasattr(self.model, "last_context_vector")
+        save_ctx = getattr(self, "save_context_vectors", False)
         if save_ctx:
-            ctx_batch = self.model.last_context_vector.float().cpu()
+            if self._last_context_vector is None:
+                raise RuntimeError(f"No context vector was captured for prediction batch {batch_idx}.")
+            ctx_batch = self._last_context_vector.float().cpu()
+            self._last_context_vector = None
+            assert ctx_batch.shape[0] == batch_size, "Context vector batch size does not match predictions"
             if self.context_vectors is None:
                 self.context_vectors = torch.zeros(
                     (len(self.name_to_index), ctx_batch.shape[1]),
@@ -91,6 +125,7 @@ class BarbetLightningModule(GeneralLightningModule):
             self.counter += batch_size
 
     def on_predict_epoch_end(self):
+        self._remove_context_vector_hook()
         print("Consolidating results per genome...")
         names = list(self.name_to_index.keys())
         self.logits /= self.counts.unsqueeze(1)  # Normalize logits by counts
@@ -167,6 +202,7 @@ class BarbetLightningModule(GeneralLightningModule):
             self.results_df = self.results_df.with_columns(
                 [pl.Series(name, values) for name, values in new_cols.items()]
             )
+            output_columns += self.category_names
             self.results_df = self.results_df[output_columns]
         else:
             print("Finding greedy predictions...")
@@ -176,6 +212,14 @@ class BarbetLightningModule(GeneralLightningModule):
                 threshold=self.threshold,
                 progress_bar=True,
             )
+
+            if self.retain_probabilities:
+                print("Converting to probabilities...")
+                self.probabilities = node_probabilities(
+                    self.logits,
+                    root=self.classification_tree,
+                    progress_bar=True,
+                )
 
             del self.logits
             gc.collect()
@@ -239,27 +283,30 @@ class BarbetLightningModule(GeneralLightningModule):
         num_predictions = max(1, num_predictions)
         rows = []
 
+        if isinstance(probs_matrix, torch.Tensor):
+            probs_matrix = probs_matrix.detach().cpu().numpy()
+
         if global_predictions:
-            # Pre-group all softmax nodes by their depth in the tree.
-            # Depth 1 = phylum, 2 = class, ..., 6 = species (for a 6-rank tree).
+            # Every taxon at a rank is a candidate, including only children. These have no
+            # output in the softmax layer as no probability split is needed, so they take the
+            # probability of their nearest ancestor in the softmax layer (1.0 for the root).
+            # prob_col maps each node to that column; column len(nodes) holds 1.0 (see below).
+            prob_col = {tree: len(nodes)}
             nodes_by_depth: dict[int, list] = {}
-            for node in nodes:
+            for node in tree.descendants:  # pre-order, so parents precede children
+                prob_col[node] = node_to_col_idx.get(node, prob_col[node.parent])
                 nodes_by_depth.setdefault(node.depth, []).append(node)
 
-            def get_joint_prob(node, genome_probs) -> float:
-                """Return the absolute (joint) probability of any node.
-
-                For nodes in the softmax layer this is read directly from
-                probs_matrix.  For single-child nodes (absent from the softmax
-                layer because no probability split is needed) the probability is
-                inherited recursively from the parent.
-                """
-                if node.is_root:
-                    return 1.0
-                if node in node_to_col_idx:
-                    return float(genome_probs[node_to_col_idx[node]])
-                # Single-child node: probability equals parent's probability.
-                return get_joint_prob(node.parent, genome_probs)
+            # Candidates at each rank are sorted by name so that a stable sort on probability
+            # breaks ties by name. Depth 1 = phylum, ..., 6 = species.
+            rank_candidates = []
+            for rank_depth in range(1, len(RANKS) + 1):
+                rank_nodes = sorted(nodes_by_depth.get(rank_depth, []), key=barbet.node_to_str)
+                rank_candidates.append((
+                    rank_nodes,
+                    np.array([prob_col[n] for n in rank_nodes], dtype=np.int64),
+                    np.array([prob_col[n.parent] for n in rank_nodes], dtype=np.int64),
+                ))
 
         for genome_idx, name in enumerate(names):
             genome_probs = probs_matrix[genome_idx]
@@ -268,10 +315,9 @@ class BarbetLightningModule(GeneralLightningModule):
                 # ── Step 1: walk the greedy conditional path ──────────────────
                 # Identifies which node at each rank is in_predicted_lineage.
                 # This mirrors the logic used in barbet-predictions.csv.
-                greedy_node_at_rank: dict[int, object] = {}
                 greedy_path_set: set = set()
                 gp_parent = tree
-                for rank_idx, rank in enumerate(RANKS):
+                for rank in RANKS:
                     gp_children = getattr(gp_parent, "children", [])
                     if not gp_children:
                         break
@@ -286,50 +332,23 @@ class BarbetLightningModule(GeneralLightningModule):
                         ]
                         gp_probs.sort(key=lambda x: (-x[1], barbet.node_to_str(x[0])))
                         gp_node = gp_probs[0][0]
-                    greedy_node_at_rank[rank_idx] = gp_node
                     greedy_path_set.add(gp_node)
                     gp_parent = gp_node
 
                 # ── Step 2: emit global top-N for every rank ──────────────────
-                for rank_idx, rank in enumerate(RANKS):
-                    rank_depth = rank_idx + 1
-                    greedy_node = greedy_node_at_rank.get(rank_idx)
-
-                    # Single-child nodes are not in node_list_softmax so they
-                    # cannot participate in a global ranking.  Emit them
-                    # separately with inherited probability and local_prob=1.0.
-                    is_single_child = (
-                        greedy_node is not None
-                        and greedy_node not in node_to_col_idx
-                    )
-                    if is_single_child:
-                        joint_prob = get_joint_prob(greedy_node.parent, genome_probs)
-                        rows.append({
-                            "name": name,
-                            "rank": rank,
-                            "taxon": barbet.node_to_str(greedy_node),
-                            "joint_probability": joint_prob,
-                            "local_probability": 1.0,
-                            "prediction_number": 1,
-                            "in_predicted_lineage": True,
-                        })
-                        continue
-
-                    rank_nodes = nodes_by_depth.get(rank_depth, [])
-                    if not rank_nodes:
-                        continue
-
+                genome_probs_ext = np.append(genome_probs, 1.0)
+                for rank, (rank_nodes, cols, parent_cols) in zip(RANKS, rank_candidates):
                     # Sort globally by joint (absolute) probability.
-                    node_joint = [
-                        (n, float(genome_probs[node_to_col_idx[n]]))
-                        for n in rank_nodes
-                    ]
-                    node_joint.sort(key=lambda x: (-x[1], barbet.node_to_str(x[0])))
+                    joint_probs = genome_probs_ext[cols]
+                    top = np.argsort(-joint_probs, kind="stable")[:num_predictions]
 
-                    for pred_num, (node, joint_prob) in enumerate(node_joint[:num_predictions], start=1):
+                    for pred_num, i in enumerate(top, start=1):
+                        node = rank_nodes[i]
                         # local_probability = softmax score within siblings
                         #                   = joint_prob / parent's joint_prob
-                        parent_joint = get_joint_prob(node.parent, genome_probs)
+                        # which is 1.0 for an only child.
+                        joint_prob = float(joint_probs[i])
+                        parent_joint = float(genome_probs_ext[parent_cols[i]])
                         local_prob = joint_prob / parent_joint if parent_joint > 0.0 else 0.0
                         rows.append({
                             "name": name,

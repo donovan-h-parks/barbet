@@ -48,7 +48,6 @@ class BarbetModel(nn.Module):
         attention_weights = torch.softmax(attention_scores, dim=1)
 
         context_vector = torch.sum(attention_weights * x, dim=1)
-        self.last_context_vector = context_vector
 
         result = self.classifier(context_vector)
 
